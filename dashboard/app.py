@@ -135,7 +135,29 @@ st.caption(
 run_tab, qc_tab = st.tabs(["Run Setup", "QC & Processed Files"])
 
 with run_tab:
-    st.subheader("1) Pipeline locations")
+    st.subheader("1) HPC login and working location")
+    hpc_col1, hpc_col2 = st.columns(2)
+    with hpc_col1:
+        hpc_username = st.text_input("HPC username", value="")
+        hpc_host = st.text_input("HPC host", value="hpc.example.edu")
+    with hpc_col2:
+        hpc_workdir = st.text_input(
+            "HPC project/work directory",
+            value="/path/on/hpc/ChIP-Seq-Analysis",
+            help="Directory on HPC where this repo and Nextflow pipeline are available.",
+        )
+        use_ssh_run = st.checkbox(
+            "Run on HPC via SSH command",
+            value=True,
+            help="Uses local ssh command with your configured key-based login.",
+        )
+
+    if hpc_username.strip() and hpc_host.strip():
+        st.caption(f"HPC session target: `{hpc_username.strip()}@{hpc_host.strip()}`")
+    else:
+        st.info("Enter HPC username + host so users can run the pipeline on HPC without manual command editing.")
+
+    st.subheader("2) Pipeline locations")
     col_a, col_b = st.columns(2)
     with col_a:
         pipeline_file = st.text_input("Nextflow pipeline file", value="chipseq_main.nf")
@@ -145,7 +167,7 @@ with run_tab:
         outdir = st.text_input("Results output directory", value="results/chipseq_pipeline")
         profile = st.text_input("Execution profile", value="slurm")
 
-    st.subheader("2) Reference and runtime settings")
+    st.subheader("3) Reference and runtime settings")
     ref_col1, ref_col2 = st.columns(2)
     with ref_col1:
         reference_fasta = st.text_input("Reference FASTA path", value="/path/to/reference/genome.fa")
@@ -164,7 +186,7 @@ with run_tab:
     make_bigwig = st.checkbox("Generate per-sample bigWig", value=True)
     make_bamcompare = st.checkbox("Generate ChIP/Input bamCompare bigWig", value=True)
 
-    st.subheader("3) Sample sheet editor")
+    st.subheader("4) Sample sheet editor")
     current_df = load_samples(samples_file)
     edited_df = st.data_editor(
         current_df,
@@ -217,17 +239,31 @@ with run_tab:
             override_path.write_text(generated_config + "\n", encoding="utf-8")
             st.success(f"Saved: {override_path}")
 
-    st.subheader("4) Run command")
-    run_cmd = (
+    st.subheader("5) Run command")
+    local_run_cmd = (
         f"nextflow run {pipeline_file} -c {config_file} -c config/chipseq_dashboard_override.config "
         f"-profile {profile} -resume"
     )
-    st.code(run_cmd, language="bash")
+    remote_run_cmd = (
+        f"ssh {hpc_username.strip()}@{hpc_host.strip()} "
+        f"\"cd {hpc_workdir} && {local_run_cmd}\""
+        if hpc_username.strip() and hpc_host.strip()
+        else ""
+    )
+
+    st.markdown("**Local command (run from current machine):**")
+    st.code(local_run_cmd, language="bash")
+    st.markdown("**HPC command (recommended):**")
+    st.code(
+        remote_run_cmd if remote_run_cmd else "Provide HPC username and host to generate SSH command.",
+        language="bash",
+    )
 
     if st.button("Run pipeline from dashboard"):
+        cmd_to_run = remote_run_cmd if use_ssh_run and remote_run_cmd else local_run_cmd
         with st.spinner("Running Nextflow. This can take a long time..."):
             proc = subprocess.run(
-                run_cmd,
+                cmd_to_run,
                 shell=True,
                 check=False,
                 capture_output=True,
@@ -264,3 +300,12 @@ with qc_tab:
         - Users can download `.bw` later via their usual HPC connection tools (SCP/SFTP/Globus).
         """
     )
+
+    if hpc_username.strip() and hpc_host.strip():
+        st.markdown("**Optional `.bw` download command template (outside dashboard):**")
+        st.code(
+            (
+                f"scp {hpc_username.strip()}@{hpc_host.strip()}:{outdir}/coverage/bigwig/*.bw ./"
+            ),
+            language="bash",
+        )

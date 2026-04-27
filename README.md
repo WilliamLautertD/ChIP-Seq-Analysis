@@ -37,10 +37,12 @@ A Streamlit dashboard is available at `dashboard/app.py` to help users who are n
 ### What it supports
 
 - Edit sample metadata and file paths directly in a table (sample name, FASTQ pairs, control pairing).
+- Enter HPC login target (username, host, remote working directory) so users can run the pipeline with generated SSH command syntax.
 - Set core run parameters (reference paths, MAPQ/filter settings, output directory, profile).
 - Save `config/chipseq_samples.tsv` from the UI.
 - Generate a dashboard override config at `config/chipseq_dashboard_override.config`.
 - Launch the Nextflow command from the dashboard (optional).
+- Optionally run through SSH (`user@host`) so execution happens on HPC rather than local machine.
 - View a separate **QC & Processed Files** tab with counts/status for FastQC, fastp, BAM, bigWig, bamCompare outputs, and MultiQC presence.
 
 ### Run the dashboard
