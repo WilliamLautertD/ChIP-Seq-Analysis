@@ -29,3 +29,25 @@ For SLURM:
 ```bash
 nextflow run chipseq_main.nf -c chipseq_nextflow.config -profile slurm -resume
 ```
+
+## Dashboard (for non-terminal users)
+
+A Streamlit dashboard is available at `dashboard/app.py` to help users who are not comfortable with HPC terminals.
+
+### What it supports
+
+- Edit sample metadata and file paths directly in a table (sample name, FASTQ pairs, control pairing).
+- Set core run parameters (reference paths, MAPQ/filter settings, output directory, profile).
+- Save `config/chipseq_samples.tsv` from the UI.
+- Generate a dashboard override config at `config/chipseq_dashboard_override.config`.
+- Launch the Nextflow command from the dashboard (optional).
+- View a separate **QC & Processed Files** tab with counts/status for FastQC, fastp, BAM, bigWig, bamCompare outputs, and MultiQC presence.
+
+### Run the dashboard
+
+```bash
+pip install streamlit pandas
+streamlit run dashboard/app.py
+```
+
+The dashboard is designed so that users review QC and file status there, and download `.bw` files later using their normal HPC connection method (SCP/SFTP/Globus).
