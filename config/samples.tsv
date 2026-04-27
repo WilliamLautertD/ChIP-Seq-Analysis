@@ -1,0 +1,4 @@
+sample	fastq_r1	fastq_r2	cnv_role	cnv_reference_group	read_group_library	read_group_unit
+NORMAL_1	/path/to/NORMAL_1_R1.fastq.gz	/path/to/NORMAL_1_R2.fastq.gz	normal	RPE	lib1	unit1
+NORMAL_2	/path/to/NORMAL_2_R1.fastq.gz	/path/to/NORMAL_2_R2.fastq.gz	normal	RPE	lib1	unit1
+TUMOR_1	/path/to/TUMOR_1_R1.fastq.gz	/path/to/TUMOR_1_R2.fastq.gz	case	RPE	lib1	unit1

@@ -1,0 +1,16 @@
+name: qc_mapping_cnv
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - nextflow
+  - fastqc
+  - fastp
+  - multiqc
+  - bwa
+  - samtools
+  - picard
+  - deeptools
+  - cnvkit
+  - gatk4
