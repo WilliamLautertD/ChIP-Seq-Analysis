@@ -10,19 +10,16 @@ process FASTQC_RAW {
     tuple val(meta), path(reads)
 
     output:
-    tuple val(meta), path("${meta.id}.raw_fastqc.done")
     path("*_fastqc.html"), emit: html
     path("*_fastqc.zip"), emit: zip
 
     script:
     """
     fastqc -t ${task.cpus} ${reads}
-    touch ${meta.id}.raw_fastqc.done
     """
 
     stub:
     """
-    touch ${meta.id}.raw_fastqc.done
     touch ${meta.id}_R1_fastqc.html ${meta.id}_R1_fastqc.zip
     touch ${meta.id}_R2_fastqc.html ${meta.id}_R2_fastqc.zip
     """
@@ -70,19 +67,16 @@ process FASTQC_TRIMMED {
     tuple val(meta), path(r1), path(r2)
 
     output:
-    tuple val(meta), path("${meta.id}.trimmed_fastqc.done")
     path("*_fastqc.html"), emit: html
     path("*_fastqc.zip"), emit: zip
 
     script:
     """
     fastqc -t ${task.cpus} ${r1} ${r2}
-    touch ${meta.id}.trimmed_fastqc.done
     """
 
     stub:
     """
-    touch ${meta.id}.trimmed_fastqc.done
     touch ${meta.id}.trimmed.R1_fastqc.html ${meta.id}.trimmed.R1_fastqc.zip
     touch ${meta.id}.trimmed.R2_fastqc.html ${meta.id}.trimmed.R2_fastqc.zip
     """
@@ -121,7 +115,36 @@ process BWA_MEM_FILTER {
     """
 }
 
-process BAM_COVERAGE {
+process BOWTIE2_ALIGN {
+    tag "${meta.id}"
+    publishDir "${params.outdir}/mapping/bam", mode: 'copy'
+
+    input:
+    tuple val(meta), path(r1), path(r2)
+
+    output:
+    tuple val(meta), path("${meta.id}.filtered.bam"), path("${meta.id}.filtered.bam.bai"), path("${meta.id}.flagstat.tsv"), emit: bam
+
+    script:
+    def ref = params.bowtie2_index_prefix ?: error("bowtie2 mapper requires params.bowtie2_index_prefix to be set")
+    """
+    bowtie2 -x ${ref} -1 ${r1} -2 ${r2} --threads ${task.cpus} -S - \
+      | samtools view -@ ${task.cpus} -b -q ${params.min_mapq} -F ${params.exclude_flags} - \
+      | samtools sort -@ ${task.cpus} -o ${meta.id}.filtered.bam -
+
+    samtools index -@ ${task.cpus} ${meta.id}.filtered.bam
+    samtools flagstat -@ ${task.cpus} -O tsv ${meta.id}.filtered.bam > ${meta.id}.flagstat.tsv
+    """
+
+    stub:
+    """
+    touch ${meta.id}.filtered.bam
+    touch ${meta.id}.filtered.bam.bai
+    touch ${meta.id}.flagstat.tsv
+    """
+}
+
+
     tag "${meta.id}"
     publishDir "${params.outdir}/coverage/bigwig", mode: 'copy'
 
@@ -200,21 +223,36 @@ process MULTIQC {
 }
 
 
-def validateBwaReference() {
-    def ref = (params.bwa_index_prefix ?: params.reference_fasta)?.toString()?.trim()
-    if (!ref) {
-        error "Set either params.bwa_index_prefix or params.reference_fasta in chipseq_nextflow.config"
-    }
+def validateReference() {
+    def mapper = params.mapper?.toString()?.toLowerCase()?.trim() ?: 'bwa'
 
-    def expectedExts = ['.amb', '.ann', '.bwt', '.pac', '.sa']
-    def missing = expectedExts.findAll { ext -> !file("${ref}${ext}").exists() }
-    if (missing) {
-        error "BWA index files are missing for '${ref}'. Missing: ${missing.join(', ')}. Set params.bwa_index_prefix to the index basename (e.g. /path/to/hg19) or params.reference_fasta to a FASTA with generated BWA index files."
+    if (mapper == 'bwa') {
+        def ref = (params.bwa_index_prefix ?: params.reference_fasta)?.toString()?.trim()
+        if (!ref) {
+            error "For BWA mapper, set either params.bwa_index_prefix or params.reference_fasta in chipseq_nextflow.config"
+        }
+        def expectedExts = ['.amb', '.ann', '.bwt', '.pac', '.sa']
+        def missing = expectedExts.findAll { ext -> !file("${ref}${ext}").exists() }
+        if (missing) {
+            error "BWA index files are missing for '${ref}'. Missing: ${missing.join(', ')}. Set params.bwa_index_prefix to the index basename (e.g. /path/to/hg19)"
+        }
+    } else if (mapper == 'bowtie2') {
+        def ref = params.bowtie2_index_prefix?.toString()?.trim()
+        if (!ref) {
+            error "For bowtie2 mapper, set params.bowtie2_index_prefix in chipseq_nextflow.config (e.g. /path/to/hg19)"
+        }
+        def expectedExts = ['.1.bt2', '.2.bt2', '.3.bt2', '.4.bt2', '.rev.1.bt2', '.rev.2.bt2']
+        def missing = expectedExts.findAll { ext -> !file("${ref}${ext}").exists() }
+        if (missing) {
+            error "bowtie2 index files are missing for '${ref}'. Missing: ${missing.join(', ')}"
+        }
+    } else {
+        error "Invalid mapper '${mapper}'. Choose 'bwa' or 'bowtie2'"
     }
 }
 
 workflow {
-    validateBwaReference()
+    validateReference()
 
     samples_ch = Channel
         .fromPath(params.samples)
@@ -252,18 +290,28 @@ workflow {
     FASTQC_RAW(raw_reads_ch)
     FASTP_TRIM(samples_ch)
     FASTQC_TRIMMED(FASTP_TRIM.out.trimmed)
-    BWA_MEM_FILTER(FASTP_TRIM.out.trimmed)
+
+    def mapper = params.mapper?.toString()?.toLowerCase()?.trim() ?: 'bwa'
+    if (mapper == 'bwa') {
+        BWA_MEM_FILTER(FASTP_TRIM.out.trimmed)
+        mapping_bam = BWA_MEM_FILTER.out.bam
+    } else if (mapper == 'bowtie2') {
+        BOWTIE2_ALIGN(FASTP_TRIM.out.trimmed)
+        mapping_bam = BOWTIE2_ALIGN.out.bam
+    } else {
+        error "Invalid mapper '${mapper}'. Choose 'bwa' or 'bowtie2'"
+    }
 
     if (params.make_bigwig) {
-        BAM_COVERAGE(BWA_MEM_FILTER.out.bam)
+        BAM_COVERAGE(mapping_bam)
     }
 
     if (params.make_bamcompare) {
-        input_bams_ch = BWA_MEM_FILTER.out.bam
+        input_bams_ch = mapping_bam
             .filter { meta, bam, bai, flagstat -> meta.condition.toString().equalsIgnoreCase('Input') }
             .map { meta, bam, bai, flagstat -> tuple(meta.id, bam, bai) }
 
-        chip_bams_ch = BWA_MEM_FILTER.out.bam
+        chip_bams_ch = mapping_bam
             .filter { meta, bam, bai, flagstat -> !meta.condition.toString().equalsIgnoreCase('Input') }
             .map { meta, bam, bai, flagstat -> tuple(meta.control_sample, meta, bam, bai) }
 
@@ -281,7 +329,7 @@ workflow {
         .mix(FASTQC_TRIMMED.out.zip)
         .mix(FASTP_TRIM.out.html)
         .mix(FASTP_TRIM.out.json)
-        .mix(BWA_MEM_FILTER.out.bam.map { meta, bam, bai, flagstat -> flagstat })
+        .mix(mapping_bam.map { meta, bam, bai, flagstat -> flagstat })
         .collect()
 
     MULTIQC(multiqc_inputs)
