@@ -1,311 +1,477 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""
+ChIP-seq pipeline dashboard (Streamlit).
 
-from pathlib import Path
+Purpose: let non-terminal users run chipseq_main.nf without typing commands.
+Design: runs ON the HPC (login/interactive node). Windows users reach it in a
+browser via a one-time SSH tunnel:
+
+    ssh -L 8501:localhost:8501 user@hpc-host
+    # then on the HPC:
+    streamlit run dashboard/app.py --server.port 8501
+    # then open http://localhost:8501 in the Windows browser
+
+No passwords are entered in this app. Nextflow launches on the HPC, where the
+data and index live. Authentication stays in the user's own SSH session.
+
+Run:
+    pip install streamlit pandas
+    streamlit run dashboard/app.py
+"""
+
+import os
+import json
+import shlex
 import subprocess
-import textwrap
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="ChIP-seq Pipeline Dashboard", layout="wide")
+# --------------------------------------------------------------------------- #
+#  Paths / defaults
+# --------------------------------------------------------------------------- #
+APP_DIR      = os.path.dirname(os.path.abspath(__file__))
+PIPELINE_DIR = os.path.dirname(APP_DIR)          # repo root (parent of dashboard/)
+STATE_FILE   = os.path.join(APP_DIR, ".dashboard_state.json")
 
-SAMPLE_COLUMNS = [
-    "sample",
-    "fastq_r1",
-    "fastq_r2",
-    "condition",
-    "replicate",
-    "read_group_library",
-    "read_group_unit",
-    "control_sample",
+REQUIRED_COLS = [
+    "sample", "fastq_r1", "fastq_r2", "mark", "genotype",
+    "replicate", "read_group_library", "read_group_unit", "control_sample",
 ]
 
-DEFAULT_ROWS = [
-    {
-        "sample": "Sample_Chip_01",
-        "fastq_r1": "/path/to/Sample_Chip_01_R1.fastq.gz",
-        "fastq_r2": "/path/to/Sample_Chip_01_R2.fastq.gz",
-        "condition": "H3K27ac",
-        "replicate": "1",
-        "read_group_library": "lib001",
-        "read_group_unit": "unitA",
-        "control_sample": "Sample_Input_01",
-    },
-    {
-        "sample": "Sample_Input_01",
-        "fastq_r1": "/path/to/Sample_Input_01_R1.fastq.gz",
-        "fastq_r2": "/path/to/Sample_Input_01_R2.fastq.gz",
-        "condition": "Input",
-        "replicate": "1",
-        "read_group_library": "lib001",
-        "read_group_unit": "unitA",
-        "control_sample": "",
-    },
-]
+TEMPLATE_ROW = {
+    "sample": "", "fastq_r1": "", "fastq_r2": "", "mark": "", "genotype": "",
+    "replicate": "1", "read_group_library": "lib001",
+    "read_group_unit": "unitA", "control_sample": "",
+}
 
 
-def load_samples(path: str) -> pd.DataFrame:
-    sample_path = Path(path)
-    if sample_path.exists():
+# --------------------------------------------------------------------------- #
+#  Small helpers
+# --------------------------------------------------------------------------- #
+def load_state() -> dict:
+    if os.path.exists(STATE_FILE):
         try:
-            df = pd.read_csv(sample_path, sep="\t")
-            for col in SAMPLE_COLUMNS:
-                if col not in df.columns:
-                    df[col] = ""
-            return df[SAMPLE_COLUMNS].fillna("")
-        except Exception as exc:  # noqa: BLE001
-            st.warning(f"Could not load existing TSV from {path}: {exc}")
-    return pd.DataFrame(DEFAULT_ROWS, columns=SAMPLE_COLUMNS)
+            with open(STATE_FILE) as fh:
+                return json.load(fh)
+        except Exception:
+            return {}
+    return {}
 
 
-def validate_samples(df: pd.DataFrame) -> list[str]:
-    errors: list[str] = []
-    blank_samples = df[df["sample"].astype(str).str.strip() == ""]
-    if not blank_samples.empty:
-        errors.append("Every row must have a non-empty sample name.")
-
-    missing_fastq = df[
-        (df["fastq_r1"].astype(str).str.strip() == "")
-        | (df["fastq_r2"].astype(str).str.strip() == "")
-    ]
-    if not missing_fastq.empty:
-        errors.append("Every row must include fastq_r1 and fastq_r2 paths.")
-
-    input_mask = df["condition"].astype(str).str.lower() == "input"
-    missing_control = df[~input_mask & (df["control_sample"].astype(str).str.strip() == "")]
-    if not missing_control.empty:
-        errors.append(
-            "Non-Input samples must have a control_sample that references an Input sample ID."
-        )
-
-    sample_ids = set(df["sample"].astype(str).str.strip())
-    bad_control_refs = [
-        ref
-        for ref in df["control_sample"].astype(str).str.strip()
-        if ref and ref not in sample_ids
-    ]
-    if bad_control_refs:
-        errors.append(
-            "Some control_sample values are not present in the sample column: "
-            + ", ".join(sorted(set(bad_control_refs)))
-        )
-
-    return errors
+def save_state(d: dict) -> None:
+    try:
+        with open(STATE_FILE, "w") as fh:
+            json.dump(d, fh, indent=2)
+    except Exception as exc:
+        st.warning(f"Could not save dashboard state: {exc}")
 
 
-def results_snapshot(results_root: Path) -> pd.DataFrame:
-    rows = []
-    folders = {
-        "Raw FASTQC HTML": results_root / "qc" / "raw",
-        "Trimmed FASTQC HTML": results_root / "qc" / "trimmed",
-        "Fastp HTML": results_root / "fastq_trimmed",
-        "Filtered BAM": results_root / "mapping" / "bam",
-        "BigWig": results_root / "coverage" / "bigwig",
-        "bamCompare BigWig": results_root / "coverage" / "bamcompare",
-    }
+def read_table(uploaded) -> pd.DataFrame:
+    """Read an uploaded sample sheet, tab first then comma."""
+    for sep in ("\t", ","):
+        try:
+            uploaded.seek(0)
+            df = pd.read_csv(uploaded, sep=sep, dtype=str).fillna("")
+            if df.shape[1] > 1:
+                return df
+        except Exception:
+            continue
+    uploaded.seek(0)
+    return pd.read_csv(uploaded, sep="\t", dtype=str).fillna("")
 
-    for label, folder in folders.items():
-        if folder.exists():
-            if "FASTQC" in label:
-                count = len(list(folder.rglob("*_fastqc.html")))
-            elif label == "Fastp HTML":
-                count = len(list(folder.glob("*.fastp.html")))
-            elif label == "Filtered BAM":
-                count = len(list(folder.glob("*.filtered.bam")))
-            elif label == "BigWig":
-                count = len(list(folder.glob("*.bw")))
-            else:
-                count = len(list(folder.glob("*.ratio.bw")))
-            status = "Available" if count > 0 else "Folder exists (no files found yet)"
+
+def validate_samples(df: pd.DataFrame):
+    """Mirror the checks chipseq_main.nf does, so users catch errors early."""
+    errors, warnings = [], []
+
+    missing_cols = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing_cols:
+        errors.append(f"Missing columns: {', '.join(missing_cols)}")
+        return errors, warnings  # can't check rows without columns
+
+    ids = [s.strip() for s in df["sample"].tolist()]
+    if any(not s for s in ids):
+        errors.append("Every row needs a non-empty 'sample'.")
+    dupes = {s for s in ids if ids.count(s) > 1 and s}
+    if dupes:
+        errors.append(f"Duplicate sample IDs: {', '.join(sorted(dupes))}")
+    id_set = set(ids)
+
+    for _, row in df.iterrows():
+        sid = row["sample"].strip()
+        if not sid:
+            continue
+        if not row["fastq_r1"].strip() or not row["fastq_r2"].strip():
+            errors.append(f"{sid}: missing fastq_r1 or fastq_r2.")
+        if not row["mark"].strip():
+            errors.append(f"{sid}: missing 'mark' (use INPUT for controls).")
+
+        is_input = row["mark"].strip().upper() == "INPUT"
+        ctrl = row["control_sample"].strip()
+        if is_input:
+            if ctrl:
+                warnings.append(f"{sid}: INPUT rows should have an empty control_sample.")
         else:
-            count = 0
-            status = "Not found"
+            if not ctrl:
+                errors.append(f"{sid}: needs control_sample (its INPUT sample ID).")
+            elif ctrl not in id_set:
+                errors.append(f"{sid}: control_sample '{ctrl}' is not a sample in the sheet.")
 
-        rows.append({"Artifact": label, "Count": count, "Status": status, "Path": str(folder)})
+        for col in ("fastq_r1", "fastq_r2"):
+            p = row[col].strip()
+            if p and not os.path.exists(p):
+                warnings.append(f"{sid}: {col} not found on disk: {p}")
 
-    return pd.DataFrame(rows)
+    return errors, warnings
 
 
-st.title("ChIP-seq Nextflow Dashboard")
-st.caption(
-    "Build sample sheets + config safely, run the pipeline, and monitor QC/processed outputs "
-    "without editing files by hand in the terminal."
+def render_override(params: dict) -> str:
+    lines = [
+        "// Auto-generated by the ChIP-seq dashboard.",
+        "// Overrides values in chipseq_nextflow.config (passed after it with -c).",
+        "",
+        "params {",
+    ]
+    for k, v in params.items():
+        if isinstance(v, bool):
+            val = "true" if v else "false"
+        elif isinstance(v, (int, float)):
+            val = str(v)
+        else:
+            val = "'" + str(v).replace("'", "\\'") + "'"
+        lines.append(f"    {k} = {val}")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def build_command(nf, base_cfg, override_cfg, profile, resume, stub):
+    parts = ["nextflow", "run", shlex.quote(nf),
+             "-c", shlex.quote(base_cfg),
+             "-c", shlex.quote(override_cfg),
+             "-profile", profile]
+    if resume:
+        parts.append("-resume")
+    if stub:
+        parts.append("-stub-run")
+    return " ".join(parts)
+
+
+def launch_detached(pipeline_dir, pre_cmds, cmd, logfile):
+    """Write a wrapper script and run it with nohup so it survives browser reloads."""
+    script = "#!/bin/bash\n"
+    script += f"cd {shlex.quote(pipeline_dir)}\n"
+    if pre_cmds.strip():
+        script += pre_cmds.strip() + "\n"
+    script += cmd + "\n"
+    sh_path = os.path.join(pipeline_dir, "dashboard_run.sh")
+    with open(sh_path, "w") as fh:
+        fh.write(script)
+    os.chmod(sh_path, 0o755)
+    subprocess.Popen(
+        f"nohup bash {shlex.quote(sh_path)} > {shlex.quote(logfile)} 2>&1 &",
+        shell=True, cwd=pipeline_dir,
+    )
+    return sh_path
+
+
+def tail(path, n=200):
+    if not os.path.exists(path):
+        return "(no log yet)"
+    try:
+        with open(path, errors="replace") as fh:
+            return "".join(fh.readlines()[-n:])
+    except Exception as exc:
+        return f"(could not read log: {exc})"
+
+
+def count_glob(base, pattern):
+    import glob
+    return sorted(glob.glob(os.path.join(base, pattern), recursive=True))
+
+
+# --------------------------------------------------------------------------- #
+#  App
+# --------------------------------------------------------------------------- #
+st.set_page_config(page_title="ChIP-seq pipeline", layout="wide")
+st.title("ChIP-seq pipeline dashboard")
+st.caption("Upload your sample table, set the parameters, and launch the pipeline "
+           "on the HPC — no terminal commands needed.")
+
+state = load_state()
+
+with st.sidebar:
+    st.header("Locations")
+    pipeline_dir = st.text_input("Pipeline folder (has chipseq_main.nf)",
+                                 value=state.get("pipeline_dir", PIPELINE_DIR))
+    main_nf   = st.text_input("main.nf",
+                              value=state.get("main_nf", os.path.join(pipeline_dir, "chipseq_main.nf")))
+    base_cfg  = st.text_input("base config",
+                              value=state.get("base_cfg", os.path.join(pipeline_dir, "chipseq_nextflow.config")))
+    samples_path = st.text_input("sample sheet path",
+                                 value=state.get("samples_path", os.path.join(pipeline_dir, "config", "chipseq_samples.tsv")))
+    st.divider()
+    st.caption("This dashboard runs on the HPC. Reach it from Windows with:\n\n"
+               "`ssh -L 8501:localhost:8501 user@host`\n\nthen open "
+               "http://localhost:8501")
+
+tab_samples, tab_run, tab_results = st.tabs(
+    ["1 · Sample sheet", "2 · Parameters & run", "3 · Results & QC"]
 )
 
-run_tab, qc_tab = st.tabs(["Run Setup", "QC & Processed Files"])
+# --------------------------------------------------------------------------- #
+#  Tab 1: sample sheet
+# --------------------------------------------------------------------------- #
+with tab_samples:
+    st.subheader("Sample sheet")
+    st.write("Upload an existing table, or start from the template and edit it below. "
+             "Use `INPUT` in the **mark** column for control samples, and put the "
+             "matched INPUT sample ID in **control_sample** for each ChIP row.")
 
-with run_tab:
-    st.subheader("1) HPC login and working location")
-    hpc_col1, hpc_col2 = st.columns(2)
-    with hpc_col1:
-        hpc_username = st.text_input("HPC username", value="")
-        hpc_host = st.text_input("HPC host", value="hpc.example.edu")
-    with hpc_col2:
-        hpc_workdir = st.text_input(
-            "HPC project/work directory",
-            value="/path/on/hpc/ChIP-Seq-Analysis",
-            help="Directory on HPC where this repo and Nextflow pipeline are available.",
-        )
-        use_ssh_run = st.checkbox(
-            "Run on HPC via SSH command",
-            value=True,
-            help="Uses local ssh command with your configured key-based login.",
-        )
+    up = st.file_uploader("Upload sample sheet (.tsv or .csv)", type=["tsv", "csv", "txt"])
+    c1, c2 = st.columns(2)
+    if c1.button("Load uploaded file") and up is not None:
+        st.session_state["samples_df"] = read_table(up)
+    if c2.button("Start from template"):
+        st.session_state["samples_df"] = pd.DataFrame([TEMPLATE_ROW])
+    if "samples_df" not in st.session_state:
+        if os.path.exists(samples_path):
+            st.session_state["samples_df"] = pd.read_csv(samples_path, sep="\t", dtype=str).fillna("")
+        else:
+            st.session_state["samples_df"] = pd.DataFrame([TEMPLATE_ROW])
 
-    if hpc_username.strip() and hpc_host.strip():
-        st.caption(f"HPC session target: `{hpc_username.strip()}@{hpc_host.strip()}`")
-    else:
-        st.info("Enter HPC username + host so users can run the pipeline on HPC without manual command editing.")
-
-    st.subheader("2) Pipeline locations")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        pipeline_file = st.text_input("Nextflow pipeline file", value="chipseq_main.nf")
-        config_file = st.text_input("Nextflow config file", value="chipseq_nextflow.config")
-        samples_file = st.text_input("Samples TSV output path", value="config/chipseq_samples.tsv")
-    with col_b:
-        outdir = st.text_input("Results output directory", value="results/chipseq_pipeline")
-        profile = st.text_input("Execution profile", value="slurm")
-
-    st.subheader("3) Reference and runtime settings")
-    ref_col1, ref_col2 = st.columns(2)
-    with ref_col1:
-        reference_fasta = st.text_input("Reference FASTA path", value="/path/to/reference/genome.fa")
-        bwa_index_prefix = st.text_input(
-            "BWA index prefix (basename)",
-            value="/path/to/reference/index_basename",
-            help="Equivalent to params.bwa_index_prefix in chipseq_nextflow.config",
-        )
-    with ref_col2:
-        effective_genome_size = st.number_input(
-            "Effective genome size", min_value=1, value=2913022398, step=1
-        )
-        min_mapq = st.number_input("Minimum MAPQ", min_value=0, value=30, step=1)
-        exclude_flags = st.number_input("Exclude flags", min_value=0, value=3332, step=1)
-
-    make_bigwig = st.checkbox("Generate per-sample bigWig", value=True)
-    make_bamcompare = st.checkbox("Generate ChIP/Input bamCompare bigWig", value=True)
-
-    st.subheader("4) Sample sheet editor")
-    current_df = load_samples(samples_file)
-    edited_df = st.data_editor(
-        current_df,
+    edited = st.data_editor(
+        st.session_state["samples_df"],
         num_rows="dynamic",
         use_container_width=True,
-        column_config={
-            "sample": st.column_config.TextColumn(required=True),
-            "fastq_r1": st.column_config.TextColumn(required=True),
-            "fastq_r2": st.column_config.TextColumn(required=True),
-            "control_sample": st.column_config.TextColumn(
-                help="For non-Input rows, set to sample ID of Input control"
-            ),
-        },
-        key="sample_editor",
+        key="samples_editor",
     )
 
-    errors = validate_samples(edited_df.fillna(""))
-    if errors:
-        for err in errors:
-            st.error(err)
-    else:
-        st.success("Sample sheet validation passed.")
-
-    write_col1, write_col2 = st.columns(2)
-    with write_col1:
-        if st.button("Save samples TSV", type="primary", use_container_width=True):
-            Path(samples_file).parent.mkdir(parents=True, exist_ok=True)
-            edited_df.fillna("").to_csv(samples_file, sep="\t", index=False)
-            st.success(f"Saved: {samples_file}")
-
-    generated_config = textwrap.dedent(
-        f"""
-        params {{
-            samples = '{samples_file}'
-            outdir = '{outdir}'
-            reference_fasta = '{reference_fasta}'
-            bwa_index_prefix = '{bwa_index_prefix}'
-            min_mapq = {int(min_mapq)}
-            exclude_flags = {int(exclude_flags)}
-            make_bigwig = {'true' if make_bigwig else 'false'}
-            make_bamcompare = {'true' if make_bamcompare else 'false'}
-            effective_genome_size = {int(effective_genome_size)}
-        }}
-        """
-    ).strip()
-
-    with write_col2:
-        if st.button("Write dashboard config override", use_container_width=True):
-            override_path = Path("config/chipseq_dashboard_override.config")
-            override_path.write_text(generated_config + "\n", encoding="utf-8")
-            st.success(f"Saved: {override_path}")
-
-    st.subheader("5) Run command")
-    local_run_cmd = (
-        f"nextflow run {pipeline_file} -c {config_file} -c config/chipseq_dashboard_override.config "
-        f"-profile {profile} -resume"
-    )
-    remote_run_cmd = (
-        f"ssh {hpc_username.strip()}@{hpc_host.strip()} "
-        f"\"cd {hpc_workdir} && {local_run_cmd}\""
-        if hpc_username.strip() and hpc_host.strip()
-        else ""
-    )
-
-    st.markdown("**Local command (run from current machine):**")
-    st.code(local_run_cmd, language="bash")
-    st.markdown("**HPC command (recommended):**")
-    st.code(
-        remote_run_cmd if remote_run_cmd else "Provide HPC username and host to generate SSH command.",
-        language="bash",
-    )
-
-    if st.button("Run pipeline from dashboard"):
-        cmd_to_run = remote_run_cmd if use_ssh_run and remote_run_cmd else local_run_cmd
-        with st.spinner("Running Nextflow. This can take a long time..."):
-            proc = subprocess.run(
-                cmd_to_run,
-                shell=True,
-                check=False,
-                capture_output=True,
-                text=True,
-            )
-        st.write("Exit code:", proc.returncode)
-        if proc.stdout:
-            st.text_area("Stdout", proc.stdout[-15000:], height=240)
-        if proc.stderr:
-            st.text_area("Stderr", proc.stderr[-15000:], height=240)
-        if proc.returncode == 0:
-            st.success("Pipeline command finished successfully.")
+    v1, v2 = st.columns(2)
+    if v1.button("Validate"):
+        errs, warns = validate_samples(edited)
+        if errs:
+            for e in errs:
+                st.error(e)
         else:
-            st.error("Pipeline command failed. Check stderr above.")
+            st.success("No blocking errors found.")
+        for w in warns:
+            st.warning(w)
 
-with qc_tab:
-    st.subheader("QC and processed files overview")
-    results_root = Path(outdir)
-    snapshot_df = results_snapshot(results_root)
-    st.dataframe(snapshot_df, use_container_width=True)
+    if v2.button("Save sample sheet"):
+        errs, _ = validate_samples(edited)
+        if errs:
+            st.error("Fix the errors above before saving.")
+        else:
+            os.makedirs(os.path.dirname(samples_path), exist_ok=True)
+            edited.to_csv(samples_path, sep="\t", index=False)
+            st.session_state["samples_df"] = edited
+            st.success(f"Saved to {samples_path}")
 
-    multiqc_report = results_root / "qc" / "multiqc_report.html"
-    if multiqc_report.exists():
-        st.success(f"MultiQC report found: {multiqc_report}")
-    else:
-        st.info(f"MultiQC report not found yet at: {multiqc_report}")
+# --------------------------------------------------------------------------- #
+#  Tab 2: parameters & run
+# --------------------------------------------------------------------------- #
+with tab_run:
+    st.subheader("Parameters")
 
-    st.markdown(
-        """
-        **Expected final data flow**
+    colA, colB = st.columns(2)
+    with colA:
+        outdir = st.text_input("Output directory", value=state.get("outdir", "results/chipseq_pipeline"))
+        mapper = st.selectbox("Mapper", ["bwa-mem2", "bowtie2"],
+                              index=0 if state.get("mapper", "bwa-mem2") == "bwa-mem2" else 1)
+        if mapper == "bwa-mem2":
+            bwamem2_index_prefix = st.text_input(
+                "bwa-mem2 index prefix (FASTA basename, e.g. /path/hg19.fa)",
+                value=state.get("bwamem2_index_prefix", ""))
+            bowtie2_index_prefix = state.get("bowtie2_index_prefix", "")
+            st.caption("Built with: bwa-mem2 index genome.fa")
+        else:
+            bowtie2_index_prefix = st.text_input(
+                "bowtie2 index prefix (basename WITHOUT .fa, e.g. /path/hg19)",
+                value=state.get("bowtie2_index_prefix", ""))
+            bwamem2_index_prefix = state.get("bwamem2_index_prefix", "")
+            st.caption("Built with: bowtie2-build ref.fa hg19")
+        profile = st.selectbox("Executor profile", ["conda", "slurm"],
+                               index=0 if state.get("profile", "conda") == "conda" else 1)
 
-        - QC and process outputs are reviewed here.
-        - bigWig (`.bw`) files remain on HPC storage.
-        - Users can download `.bw` later via their usual HPC connection tools (SCP/SFTP/Globus).
-        """
+    with colB:
+        bam_min_mapq = st.number_input("MAPQ filter (bam_min_mapq; 0 = keep all)",
+                                       min_value=0, max_value=60,
+                                       value=int(state.get("bam_min_mapq", 0)))
+        bigwig_normalization = st.selectbox("bamCoverage normalization",
+                                            ["None", "RPKM", "CPM", "BPM", "RPGC"],
+                                            index=["None", "RPKM", "CPM", "BPM", "RPGC"].index(
+                                                state.get("bigwig_normalization", "None")))
+        blacklist_bed = st.text_input("Blacklist BED (optional)",
+                                      value=state.get("blacklist_bed", ""))
+        effective_genome_size = st.number_input("Effective genome size (RPGC only)",
+                                                min_value=0,
+                                                value=int(state.get("effective_genome_size", 2864785220)))
+
+    with st.expander("Advanced (bin sizes, read-group filter)"):
+        g1, g2, g3 = st.columns(3)
+        bigwig_binsize = g1.number_input("bamCoverage binSize", min_value=1,
+                                         value=int(state.get("bigwig_binsize", 25)))
+        bamcompare_binsize = g2.number_input("bamCompare binSize", min_value=1,
+                                             value=int(state.get("bamcompare_binsize", 200)))
+        bamcompare_smooth_length = g3.number_input("bamCompare smoothLength", min_value=1,
+                                                   value=int(state.get("bamcompare_smooth_length", 600)))
+        g4, g5, g6 = st.columns(3)
+        mbws_qc_binsize = g4.number_input("multiBigwigSummary QC binSize", min_value=1,
+                                          value=int(state.get("mbws_qc_binsize", 10000)))
+        mbws_counts_binsize = g5.number_input("multiBigwigSummary counts binSize", min_value=1,
+                                              value=int(state.get("mbws_counts_binsize", 1000)))
+        exclude_flags = g6.number_input("exclude_flags (SAM)", min_value=0,
+                                        value=int(state.get("exclude_flags", 3332)))
+
+    pre_cmds = st.text_area(
+        "Commands to run before nextflow (optional) — e.g. module load or conda activate",
+        value=state.get("pre_cmds", "module load nextflow"),
+        height=70,
     )
+    r1, r2 = st.columns(2)
+    resume = r1.checkbox("Resume (-resume)", value=True)
+    stub   = r2.checkbox("Dry wiring test (-stub-run)", value=False)
 
-    if hpc_username.strip() and hpc_host.strip():
-        st.markdown("**Optional `.bw` download command template (outside dashboard):**")
-        st.code(
-            (
-                f"scp {hpc_username.strip()}@{hpc_host.strip()}:{outdir}/coverage/bigwig/*.bw ./"
-            ),
-            language="bash",
+    # assemble params
+    params = {
+        "samples": samples_path,
+        "outdir": outdir,
+        "mapper": mapper,
+        "bam_min_mapq": int(bam_min_mapq),
+        "exclude_flags": int(exclude_flags),
+        "bigwig_binsize": int(bigwig_binsize),
+        "bigwig_normalization": bigwig_normalization,
+        "blacklist_bed": blacklist_bed,
+        "effective_genome_size": int(effective_genome_size),
+        "bamcompare_binsize": int(bamcompare_binsize),
+        "bamcompare_smooth_length": int(bamcompare_smooth_length),
+        "mbws_qc_binsize": int(mbws_qc_binsize),
+        "mbws_counts_binsize": int(mbws_counts_binsize),
+    }
+    if mapper == "bwa-mem2":
+        params["bwamem2_index_prefix"] = bwamem2_index_prefix
+    else:
+        params["bowtie2_index_prefix"] = bowtie2_index_prefix
+
+    override_cfg = os.path.join(pipeline_dir, "config", "chipseq_dashboard_override.config")
+    cmd = build_command(main_nf, base_cfg, override_cfg, profile, resume, stub)
+
+    st.subheader("Command")
+    st.code(cmd, language="bash")
+    st.caption("You can copy this into your own HPC terminal, or use the buttons below.")
+
+    b1, b2 = st.columns(2)
+    if b1.button("Generate config"):
+        # persist choices
+        state.update({
+            "pipeline_dir": pipeline_dir, "main_nf": main_nf, "base_cfg": base_cfg,
+            "samples_path": samples_path, "outdir": outdir, "mapper": mapper,
+            "bwamem2_index_prefix": bwamem2_index_prefix,
+            "bowtie2_index_prefix": bowtie2_index_prefix,
+            "profile": profile, "bam_min_mapq": int(bam_min_mapq),
+            "bigwig_normalization": bigwig_normalization, "blacklist_bed": blacklist_bed,
+            "effective_genome_size": int(effective_genome_size),
+            "bigwig_binsize": int(bigwig_binsize),
+            "bamcompare_binsize": int(bamcompare_binsize),
+            "bamcompare_smooth_length": int(bamcompare_smooth_length),
+            "mbws_qc_binsize": int(mbws_qc_binsize),
+            "mbws_counts_binsize": int(mbws_counts_binsize),
+            "exclude_flags": int(exclude_flags), "pre_cmds": pre_cmds,
+        })
+        save_state(state)
+        os.makedirs(os.path.dirname(override_cfg), exist_ok=True)
+        with open(override_cfg, "w") as fh:
+            fh.write(render_override(params))
+        st.success(f"Wrote {override_cfg}")
+        st.code(render_override(params), language="groovy")
+
+    launch_disabled = False
+    if not os.path.exists(main_nf):
+        st.error(f"main.nf not found at {main_nf}"); launch_disabled = True
+    idx = bwamem2_index_prefix if mapper == "bwa-mem2" else bowtie2_index_prefix
+    if not stub and not idx:
+        st.warning("No index prefix set — required unless you use the dry wiring test.")
+
+    if b2.button("Launch on HPC", disabled=launch_disabled, type="primary"):
+        errs, _ = validate_samples(edited) if "samples_editor" in st.session_state else ([], [])
+        # regenerate override + save samples right before launch
+        os.makedirs(os.path.dirname(override_cfg), exist_ok=True)
+        with open(override_cfg, "w") as fh:
+            fh.write(render_override(params))
+        os.makedirs("logs", exist_ok=True) if False else None
+        logdir = os.path.join(pipeline_dir, "logs")
+        os.makedirs(logdir, exist_ok=True)
+        logfile = os.path.join(logdir, "run_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".log")
+        launch_detached(pipeline_dir, pre_cmds, cmd, logfile)
+        state["last_log"] = logfile
+        save_state(state)
+        st.success("Pipeline launched. See the log below (Refresh to update).")
+
+    st.subheader("Run log")
+    logfile = state.get("last_log", "")
+    st.caption(f"Log file: {logfile or '(none yet)'}")
+    lc1, lc2 = st.columns([1, 3])
+    if lc1.button("Refresh log"):
+        st.rerun()
+    st.text_area("output", tail(logfile) if logfile else "(launch a run to see output)",
+                 height=320)
+
+# --------------------------------------------------------------------------- #
+#  Tab 3: results & QC
+# --------------------------------------------------------------------------- #
+with tab_results:
+    st.subheader("Results & QC")
+    res_dir = st.text_input("Results directory",
+                            value=state.get("outdir", "results/chipseq_pipeline"))
+    res_dir = res_dir if os.path.isabs(res_dir) else os.path.join(pipeline_dir, res_dir)
+
+    if st.button("Scan outputs"):
+        st.session_state["scanned"] = True
+
+    if st.session_state.get("scanned"):
+        checks = {
+            "Filtered BAMs":        count_glob(res_dir, "mapping/bam/*.filtered.bam"),
+            "flagstat":             count_glob(res_dir, "mapping/stats/*.flagstat.tsv"),
+            "Coverage bigWigs":     count_glob(res_dir, "BigWigs/bamCoverage/*.bw"),
+            "RPKM bigWigs":         count_glob(res_dir, "BigWigs/bamCoverage_RPKM/*.bw"),
+            "bamCompare ratio":     count_glob(res_dir, "BigWigs/bamCompare_*/*.bw"),
+            "QC matrices (npz)":    count_glob(res_dir, "QC/Matrixes/*.npz"),
+            "Raw-count tables":     count_glob(res_dir, "QC/Matrixes/*.rawcounts.tsv"),
+        }
+        status = pd.DataFrame(
+            [{"output": k, "count": len(v), "status": "OK" if v else "missing"}
+             for k, v in checks.items()]
         )
+        st.dataframe(status, use_container_width=True, hide_index=True)
+
+        st.markdown("**QC plots**")
+        for label, rel in [
+            ("PCA", "QC/PCA/pca.png"),
+            ("Correlation (Spearman)", "QC/Correlation/correlation_spearman_heatmap.png"),
+            ("Fingerprint", "QC/Fingerprint/fingerprint.png"),
+        ]:
+            p = os.path.join(res_dir, rel)
+            if os.path.exists(p):
+                st.image(p, caption=label, width=520)
+            else:
+                st.caption(f"{label}: not found ({rel})")
+
+        st.markdown("**Download small QC files**")
+        small = []
+        for pat in ("QC/**/*.png", "QC/**/*.tsv", "mapping/stats/*.tsv"):
+            small += count_glob(res_dir, pat)
+        small = sorted(set(small))
+        if not small:
+            st.caption("No QC files found yet.")
+        for f in small[:60]:
+            try:
+                with open(f, "rb") as fh:
+                    st.download_button(os.path.relpath(f, res_dir), fh.read(),
+                                       file_name=os.path.basename(f), key=f)
+            except Exception:
+                pass
+
+        st.info("bigWig (.bw) files are large — download them with your usual "
+                "HPC transfer tool (SCP / SFTP / Globus) rather than through the browser.")
