@@ -96,24 +96,30 @@ The `bamCompare` folder name is derived from `bamcompare_binsize` / `bamcompare_
 - **Genome**: defaults target **hg19** (`effective_genome_size = 2864785220`). `effective_genome_size` is only used when `bigwig_normalization = 'RPGC'`. Set `blacklist_bed` to an hg19 blacklist to exclude artifact regions from bigWigs, bamCompare, and fingerprint.
 - **Conda env**: `envs/qc_mapping_cnv.yaml` must provide the chosen aligner (`bwa-mem2` and/or `bowtie2`), `samtools`, and `deeptools`.
 
-## Dashboard (for non-terminal users) - not available 
-A Streamlit dashboard is available at `dashboard/app.py` to help users who are not comfortable with HPC terminals.
+## Dashboard (for non-terminal users)
+A plain Streamlit dashboard at `dashboard/app.py` lets users run the pipeline without typing commands. It is designed to run **on the HPC** (where Nextflow, the conda envs, the genome index, and the FASTQs all live); Windows users reach it in a browser through a one-time SSH tunnel. No passwords are entered in the app — authentication stays in the user's own SSH session.
 
-### What it supports
-- Edit sample metadata and file paths directly in a table (sample name, FASTQ pairs, `mark`/`genotype`, control pairing).
-- Enter HPC login target (username, host, remote working directory) so users can run the pipeline with generated SSH command syntax.
-- Set core run parameters (reference index prefix, mapper choice, MAPQ/filter settings, output directory, profile).
-- Save `config/chipseq_samples.tsv` from the UI.
-- Generate a dashboard override config at `config/chipseq_dashboard_override.config`.
-- Launch the Nextflow command from the dashboard (optional).
-- Optionally run through SSH (`user@host`) so execution happens on HPC rather than the local machine.
-- View a separate **QC & Processed Files** tab with counts/status for BAMs, bigWigs (coverage + RPKM), `bamCompare` ratio tracks, and deepTools QC outputs (PCA, correlation, fingerprint, `multiBigwigSummary` matrices).
-
-> Note: this pipeline does not produce FastQC/fastp/MultiQC outputs; read-level QC lives in the separate QC workflow. If `dashboard/app.py` still references those, update it to point at the deepTools QC outputs above.
-
-### Run the dashboard
+### How Windows users open it
+One terminal step, then everything else is point-and-click:
 ```bash
+# from Windows (PowerShell / Windows Terminal):
+ssh -L 8501:localhost:8501 user@your-hpc-host
+
+# then, on the HPC (first time only):
 pip install streamlit pandas
-streamlit run dashboard/app.py
+
+# start the dashboard on the HPC:
+streamlit run dashboard/app.py --server.port 8501
 ```
-The dashboard is designed so that users review QC and file status there, and download `.bw` files later using their normal HPC connection method (SCP/SFTP/Globus).
+Then open **http://localhost:8501** in the Windows browser.
+
+### Tabs
+1. **Sample sheet** — upload a `.tsv`/`.csv` or start from a template, edit it in an editable grid (add/remove rows), **Validate** (same checks as the pipeline: required columns, duplicate IDs, `control_sample` pairing, plus a warning if a FASTQ path is missing on disk), and **Save** to `config/chipseq_samples.tsv`.
+2. **Parameters & run** — choose mapper and index prefix (the field switches per mapper and reminds you bwa-mem2 keeps `.fa`, bowtie2 does not), set output dir, MAPQ, normalization, blacklist, and bin sizes. Writes `config/chipseq_dashboard_override.config` (the base config is never modified), shows the exact `nextflow run` command, and **Launch on HPC** runs it detached with `nohup` so the job survives browser reloads. A pre-run box (default `module load nextflow`) handles HPC module systems, and a run-log viewer tails the output.
+3. **Results & QC** — scans the output directory and reports presence/counts for BAMs, coverage/RPKM bigWigs, `bamCompare` tracks, and QC matrices; previews the PCA / correlation / fingerprint PNGs inline; and offers download buttons for the small QC files.
+
+### Notes
+- The launch is detached (`nohup` → `logs/run_<timestamp>.log`), so long runs continue even if the browser is closed. Reopen the dashboard later and press **Refresh log** or **Scan outputs**.
+- Requires **streamlit ≥ 1.23** (uses `st.data_editor`).
+- bigWig (`.bw`) files are large and are **not** streamed through the browser — download them with your usual HPC transfer tool (SCP / SFTP / Globus).
+- Read-level QC (FastQC / fastp / MultiQC) is not produced by this pipeline or shown in the dashboard; it belongs to the separate QC workflow.
