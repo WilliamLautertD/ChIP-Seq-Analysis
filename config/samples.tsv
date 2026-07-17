@@ -1,4 +1,7 @@
-sample	fastq_r1	fastq_r2	cnv_role	cnv_reference_group	read_group_library	read_group_unit
-NORMAL_1	/path/to/NORMAL_1_R1.fastq.gz	/path/to/NORMAL_1_R2.fastq.gz	normal	RPE	lib1	unit1
-NORMAL_2	/path/to/NORMAL_2_R1.fastq.gz	/path/to/NORMAL_2_R2.fastq.gz	normal	RPE	lib1	unit1
-TUMOR_1	/path/to/TUMOR_1_R1.fastq.gz	/path/to/TUMOR_1_R2.fastq.gz	case	RPE	lib1	unit1
+sample	fastq_r1	fastq_r2	mark	genotype	replicate	read_group_library	read_group_unit	control_sample
+RPE_EV_H3K9me3_Set_1_S5	data/04222026_RPE_EV_H3K9me3_Set_1_S5_L001_R1_001.fastq.gz	data/04222026_RPE_EV_H3K9me3_Set_1_S5_L001_R2_001.fastq.gz	H3K9me3	EV	1	lib001	unitA	RPE_EV_INPUT_S9
+RPE_EV_H3K9me3_Set_2_S7	data/04222026_RPE_EV_H3K9me3_Set_2_S7_L001_R1_001.fastq.gz	data/04222026_RPE_EV_H3K9me3_Set_2_S7_L001_R2_001.fastq.gz	H3K9me3	EV	2	lib001	unitA	RPE_EV_INPUT_S9
+RPE_EV_INPUT_S9	data/04222026_RPE_EV_INPUT_S9_L001_R1_001.fastq.gz	data/04222026_RPE_EV_INPUT_S9_L001_R2_001.fastq.gz	INPUT	EV	1	lib001	unitA	
+RPE_KDM4C_OE_H3K9me3_Set_1_S6	data/04222026_RPE_KDM4C_OE_H3K9me3_Set_1_S6_L001_R1_001.fastq.gz	data/04222026_RPE_KDM4C_OE_H3K9me3_Set_1_S6_L001_R2_001.fastq.gz	H3K9me3	KDM4C_OE	1	lib001	unitA	RPE_KDM4C_OE_INPUT_S10
+RPE_KDM4C_OE_H3K9me3_Set_2_S8	data/04222026_RPE_KDM4C_OE_H3K9me3_Set_2_S8_L001_R1_001.fastq.gz	data/04222026_RPE_KDM4C_OE_H3K9me3_Set_2_S8_L001_R2_001.fastq.gz	H3K9me3	KDM4C_OE	2	lib001	unitA	RPE_KDM4C_OE_INPUT_S10
+RPE_KDM4C_OE_INPUT_S10	data/04222026_RPE_KDM4C_OE_INPUT_S10_L001_R1_001.fastq.gz	data/04222026_RPE_KDM4C_OE_INPUT_S10_L001_R2_001.fastq.gz	INPUT	KDM4C_OE	1	lib001	unitA
